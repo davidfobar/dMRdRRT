@@ -28,9 +28,41 @@ class BaseFieldClass(ABC):
         xmin, xmax, ymin, ymax = self.bounds
         return xmin <= point[0] <= xmax and ymin <= point[1] <= ymax
 
+    def default_agent_plot_title(self, planner_name: str) -> str:
+        return f"{planner_name} Visualization"
+
+    def planner_tree_style(self) -> dict[str, float | str]:
+        return {"color": "0.75", "alpha": 1.0, "linewidth": 0.7}
+
+    def planner_path_style(self) -> dict[str, float | str]:
+        return {"color": "tab:red", "linewidth": 2.2}
+
+    def overlay_obstacle_regions(self, ax: object, *, max_grade: float | None = None) -> None:
+        """Draw field-defined obstacle overlays for a specific agent capability."""
+
+    def segment_exceeds_capability(
+        self,
+        p1: np.ndarray,
+        p2: np.ndarray,
+        *,
+        max_grade: float | None = None,
+    ) -> bool:
+        """Return True when this segment violates an agent-specific constraint."""
+        return False
+
     @abstractmethod
     def edge_is_collision_free(self, p1: np.ndarray, p2: np.ndarray) -> bool:
         """Return True when segment p1->p2 is valid under field constraints."""
+
+    @abstractmethod
+    def plot(
+        self,
+        output_path: Optional[Path] = None,
+        show: bool = True,
+        title: Optional[str] = None,
+        finalize: bool = True,
+    ) -> tuple[object, object]:
+        """Render the base field only, without agent-specific overlays."""
 
     @abstractmethod
     def plot_result(
@@ -45,6 +77,86 @@ class BaseFieldClass(ABC):
         title: Optional[str] = None,
     ) -> None:
         """Render a planner result for this field implementation."""
+
+    @staticmethod
+    def finalize_plot(fig: object, output_path: Optional[Path], show: bool) -> None:
+        if output_path is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(output_path, dpi=180, bbox_inches="tight")
+
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+    def overlay_planner_state(
+        self,
+        ax: object,
+        *,
+        nodes: list[object],
+        path: list[np.ndarray] | None,
+        start: tuple[float, float],
+        goal: tuple[float, float],
+        planner_name: str,
+    ) -> None:
+        tree_style = self.planner_tree_style()
+        path_style = self.planner_path_style()
+
+        for node in nodes:
+            if getattr(node, "parent", None) is None:
+                continue
+            parent = nodes[node.parent]
+            ax.plot(
+                [parent.x, node.x],
+                [parent.y, node.y],
+                color=tree_style["color"],
+                linewidth=tree_style["linewidth"],
+                alpha=tree_style["alpha"],
+            )
+
+        if path:
+            xs = [point[0] for point in path]
+            ys = [point[1] for point in path]
+            ax.plot(
+                xs,
+                ys,
+                color=path_style["color"],
+                linewidth=path_style["linewidth"],
+                label=f"{planner_name} path",
+            )
+
+        ax.scatter(start[0], start[1], c="tab:green", s=80, label="start", zorder=5)
+        ax.scatter(goal[0], goal[1], c="tab:blue", s=80, label="goal", zorder=5)
+
+        handles, _ = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(loc="upper left")
+
+    def render_planner_result(
+        self,
+        *,
+        nodes: list[object],
+        path: list[np.ndarray] | None,
+        start: tuple[float, float],
+        goal: tuple[float, float],
+        output_path: Optional[Path] = None,
+        show: bool = True,
+        planner_name: str = "RRT",
+        title: Optional[str] = None,
+        max_grade: float | None = None,
+    ) -> None:
+        plot_title = title if title is not None else self.default_agent_plot_title(planner_name)
+        fig, ax = self.plot(show=False, title=plot_title, finalize=False)
+        self.overlay_obstacle_regions(ax, max_grade=max_grade)
+        self.overlay_planner_state(
+            ax,
+            nodes=nodes,
+            path=path,
+            start=start,
+            goal=goal,
+            planner_name=planner_name,
+        )
+        self.finalize_plot(fig, output_path, show)
 
 
 class ToyFieldClass(BaseFieldClass):
@@ -94,6 +206,38 @@ class ToyFieldClass(BaseFieldClass):
 
         return True
 
+    def default_agent_plot_title(self, planner_name: str) -> str:
+        return f"Toy 2D {planner_name} Path Planning"
+
+    def overlay_obstacle_regions(self, ax: object, *, max_grade: float | None = None) -> None:
+        for ox, oy, r in self.obstacles:
+            ax.add_patch(Circle((ox, oy), r, facecolor="none", edgecolor="black", hatch="///", linewidth=0.0))
+
+    def plot(
+        self,
+        output_path: Optional[Path] = None,
+        show: bool = True,
+        title: Optional[str] = None,
+        finalize: bool = True,
+    ) -> tuple[object, object]:
+        fig, ax = plt.subplots(figsize=(8, 8))
+        xmin, xmax, ymin, ymax = self.bounds
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        ax.set_aspect("equal", adjustable="box")
+
+        for ox, oy, r in self.obstacles:
+            ax.add_patch(Circle((ox, oy), r, facecolor="tab:gray", edgecolor="black", alpha=0.35))
+
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.grid(alpha=0.2)
+        ax.set_title(title if title else "Toy 2D Field")
+
+        if finalize:
+            self.finalize_plot(fig, output_path, show)
+        return fig, ax
+
     def plot_result(
         self,
         nodes: list[object],
@@ -105,45 +249,16 @@ class ToyFieldClass(BaseFieldClass):
         planner_name: str = "RRT",
         title: Optional[str] = None,
     ) -> None:
-        fig, ax = plt.subplots(figsize=(8, 8))
-        xmin, xmax, ymin, ymax = self.bounds
-        ax.set_xlim(xmin, xmax)
-        ax.set_ylim(ymin, ymax)
-        ax.set_aspect("equal", adjustable="box")
-
-        for ox, oy, r in self.obstacles:
-            ax.add_patch(Circle((ox, oy), r, facecolor="tab:gray", edgecolor="black", alpha=0.35))
-
-        for node in nodes:
-            if node.parent is None:
-                continue
-            parent = nodes[node.parent]
-            ax.plot([parent.x, node.x], [parent.y, node.y], color="0.75", linewidth=0.7)
-
-        if path:
-            xs = [p[0] for p in path]
-            ys = [p[1] for p in path]
-            ax.plot(xs, ys, color="tab:red", linewidth=2.4, label=f"{planner_name} path")
-
-        ax.scatter(start[0], start[1], c="tab:green", s=80, label="start", zorder=5)
-        ax.scatter(goal[0], goal[1], c="tab:blue", s=80, label="goal", zorder=5)
-        if title:
-            ax.set_title(title)
-        else:
-            ax.set_title(f"Toy 2D {planner_name} Path Planning")
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.legend(loc="upper left")
-        ax.grid(alpha=0.2)
-
-        if output_path is not None:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(output_path, dpi=180, bbox_inches="tight")
-
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
+        self.render_planner_result(
+            nodes=nodes,
+            path=path,
+            start=start,
+            goal=goal,
+            output_path=output_path,
+            show=show,
+            planner_name=planner_name,
+            title=title,
+        )
 
 
 class TerrainFieldClass(BaseFieldClass):
@@ -157,7 +272,6 @@ class TerrainFieldClass(BaseFieldClass):
         lacunarity: float = 2.0,
         seed: int = 42,
         water_threshold: float = 0.30,
-        grade_threshold: float = 15.0,
         vehicle_footprint_m: float = 8.0,
         max_elevation: float = 100.0,
         robot_radius: float = 0.8,
@@ -172,7 +286,6 @@ class TerrainFieldClass(BaseFieldClass):
         self.lacunarity = lacunarity
         self.seed = seed
         self.water_threshold = water_threshold
-        self.grade_threshold = grade_threshold
         self.vehicle_footprint_m = vehicle_footprint_m
         self.max_elevation = max_elevation
         self.effective_water_level: float | None = None
@@ -180,23 +293,23 @@ class TerrainFieldClass(BaseFieldClass):
         self.elevation: np.ndarray | None = None
         self.grade: np.ndarray | None = None
         self.water_mask: np.ndarray | None = None
-        self.steep_grade_mask: np.ndarray | None = None
-        self.obstacle_mask: np.ndarray | None = None
+
+        self.generate_field()
 
     def generate_field(self) -> np.ndarray:
         base = self.seed % 256
-        terrain = np.zeros((self.height, self.width), dtype=float)
-
-        for y in range(self.height):
-            for x in range(self.width):
-                terrain[y, x] = pnoise2(
-                    x / self.width * self.scale,
-                    y / self.height * self.scale,
-                    octaves=self.octaves,
-                    persistence=self.persistence,
-                    lacunarity=self.lacunarity,
-                    base=base,
-                )
+        terrain = np.array([
+            pnoise2(
+                x / self.width * self.scale,
+                y / self.height * self.scale,
+                octaves=self.octaves,
+                persistence=self.persistence,
+                lacunarity=self.lacunarity,
+                base=base,
+            )
+            for y in range(self.height)
+            for x in range(self.width)
+        ]).reshape(self.height, self.width)
 
         # Use fixed remapping from approximate Perlin range [-1, 1] to [0, 1]
         # so each generated map keeps consistent relief scaling.
@@ -205,19 +318,13 @@ class TerrainFieldClass(BaseFieldClass):
         self.generate_obstacle_layers()
         return terrain
 
-    def remap_elevation(self, terrain: np.ndarray, water_level: float | None = None) -> np.ndarray:
+    def remap_elevation(self, terrain: np.ndarray, water_level: float | None = None, *, clip: bool = True) -> np.ndarray:
+        # When clip=False the result is unclipped, which is used for grade
+        # computation so the shoreline doesn't create artificial steep cliffs.
         level = self.water_threshold if water_level is None else water_level
-        denom = max(1.0 - level, 1e-9)
-        remapped = (terrain - level) / denom
-        remapped = np.clip(remapped, 0.0, 1.0)
-        return remapped * self.max_elevation
-
-    def remap_elevation_continuous(self, terrain: np.ndarray, water_level: float | None = None) -> np.ndarray:
-        # Continuous remap used for derivatives. Avoid clipping here so shoreline
-        # transitions do not create artificial vertical cliffs in grade.
-        level = self.water_threshold if water_level is None else water_level
-        denom = max(1.0 - level, 1e-9)
-        remapped = (terrain - level) / denom
+        remapped = (terrain - level) / max(1.0 - level, 1e-9)
+        if clip:
+            remapped = np.clip(remapped, 0.0, 1.0)
         return remapped * self.max_elevation
 
     def compute_grade(self, elevation: np.ndarray) -> np.ndarray:
@@ -249,7 +356,7 @@ class TerrainFieldClass(BaseFieldClass):
         radius = max(0, footprint_cells // 2)
         return self.box_filter(elevation, radius)
 
-    def generate_obstacle_layers(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def generate_obstacle_layers(self) -> np.ndarray:
         terrain = self.terrain if self.terrain is not None else self.generate_field()
 
         # If terrain values never fall below the nominal threshold, treat
@@ -261,19 +368,11 @@ class TerrainFieldClass(BaseFieldClass):
         self.effective_water_level = water_level
 
         self.elevation = self.remap_elevation(terrain, water_level=water_level)
-        continuous_elevation = self.remap_elevation_continuous(terrain, water_level=water_level)
+        continuous_elevation = self.remap_elevation(terrain, water_level=water_level, clip=False)
         smoothed_elevation = self.smooth_elevation_for_grade(continuous_elevation)
-        grade = self.compute_grade(smoothed_elevation)
-        water_mask = terrain <= water_level
-        # Keep obstacle layers disjoint so each cell is either water or steep grade.
-        steep_grade_mask = (grade >= self.grade_threshold) & (~water_mask)
-        obstacle_mask = water_mask | steep_grade_mask
-
-        self.grade = grade
-        self.water_mask = water_mask
-        self.steep_grade_mask = steep_grade_mask
-        self.obstacle_mask = obstacle_mask
-        return water_mask, steep_grade_mask, obstacle_mask
+        self.grade = self.compute_grade(smoothed_elevation)
+        self.water_mask = terrain <= water_level
+        return self.water_mask
 
     @staticmethod
     def make_terrain_colormap() -> mcolors.LinearSegmentedColormap:
@@ -292,12 +391,118 @@ class TerrainFieldClass(BaseFieldClass):
             list(zip(positions, colors)),
         )
 
-    @staticmethod
-    def make_obstacle_colormap() -> mcolors.Colormap:
-        return plt.get_cmap("Greys")
-
     def edge_is_collision_free(self, p1: np.ndarray, p2: np.ndarray) -> bool:
-        raise NotImplementedError("Collision behavior is not implemented for TerrainFieldClass yet")
+        """Check only terrain-absolute obstacles (water). Grade limits are
+        a vehicle capability and are enforced by the Agent."""
+        if self.water_mask is None:
+            self.generate_obstacle_layers()
+
+        if not self.point_in_bounds(p2):
+            return False
+
+        # Brute-force: sample at ~1-pixel intervals along the segment and
+        # reject if any sample lands in water.
+        dist = float(np.linalg.norm(p2 - p1))
+        n_samples = max(2, int(np.ceil(dist)) + 1)
+
+        for t in np.linspace(0.0, 1.0, n_samples):
+            pt = p1 + t * (p2 - p1)
+            col = int(np.clip(round(pt[0]), 0, self.width - 1))
+            row = int(np.clip(round(pt[1]), 0, self.height - 1))
+            if self.water_mask[row, col]:  # type: ignore[index]
+                return False
+
+        return True
+
+    def default_agent_plot_title(self, planner_name: str) -> str:
+        return f"Perlin Terrain {planner_name} Visualization"
+
+    def planner_tree_style(self) -> dict[str, float | str]:
+        return {"color": "white", "alpha": 0.5, "linewidth": 0.7}
+
+    def planner_path_style(self) -> dict[str, float | str]:
+        return {"color": "#e63946", "linewidth": 2.2}
+
+    def overlay_obstacle_regions(self, ax: object, *, max_grade: float | None = None) -> None:
+        water_mask = self.water_mask if self.water_mask is not None else self.generate_obstacle_layers()
+        obstacle_cmap = plt.get_cmap("Greys")
+
+        water_overlay = np.ma.masked_where(~water_mask, water_mask)
+        ax.imshow(water_overlay, origin="lower", cmap=obstacle_cmap, alpha=0.50, interpolation="nearest")
+        ax.contourf(water_mask.astype(float), levels=[0.5, 1.5], colors="none", hatches=["///"], origin="lower")
+
+        if max_grade is not None and self.grade is not None:
+            steep_grade_mask = (self.grade > max_grade) & (~water_mask)
+            steep_overlay = np.ma.masked_where(~steep_grade_mask, steep_grade_mask)
+            ax.imshow(steep_overlay, origin="lower", cmap=obstacle_cmap, alpha=0.50, interpolation="nearest")
+            ax.contourf(
+                steep_grade_mask.astype(float),
+                levels=[0.5, 1.5],
+                colors="none",
+                hatches=["\\\\"],
+                origin="lower",
+            )
+
+    def segment_exceeds_capability(
+        self,
+        p1: np.ndarray,
+        p2: np.ndarray,
+        *,
+        max_grade: float | None = None,
+    ) -> bool:
+        if max_grade is None or self.grade is None:
+            return False
+
+        dist = float(np.linalg.norm(p2 - p1))
+        n_samples = max(2, int(np.ceil(dist)) + 1)
+
+        for t in np.linspace(0.0, 1.0, n_samples):
+            pt = p1 + t * (p2 - p1)
+            col = int(np.clip(round(pt[0]), 0, self.width - 1))
+            row = int(np.clip(round(pt[1]), 0, self.height - 1))
+            if self.grade[row, col] > max_grade:
+                return True
+
+        return False
+
+    def plot(
+        self,
+        output_path: Optional[Path] = None,
+        show: bool = True,
+        title: Optional[str] = None,
+        finalize: bool = True,
+    ) -> tuple[object, object]:
+        terrain = self.terrain if self.terrain is not None else self.generate_field()
+        elevation = self.elevation if self.elevation is not None else self.remap_elevation(terrain, clip=True)
+
+        cmap = self.make_terrain_colormap()
+        ls = mcolors.LightSource(azdeg=315, altdeg=35)
+        hillshade = ls.shade(terrain, cmap=cmap, vert_exag=3.0, blend_mode="soft")
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.imshow(hillshade, origin="lower", interpolation="bilinear")
+
+        # Colorbar shows above-water elevation: 0 maps to effective shoreline.
+        water_level = self.effective_water_level if self.effective_water_level is not None else self.water_threshold
+        water_level = float(np.clip(water_level, 0.0, 1.0 - 1e-9))
+        land_colors = cmap(np.linspace(water_level, 1.0, 256))
+        land_cmap = mcolors.LinearSegmentedColormap.from_list("terrain_land", land_colors)
+
+        elevation_norm = mcolors.Normalize(vmin=0.0, vmax=self.max_elevation)
+        elevation_mappable = plt.cm.ScalarMappable(norm=elevation_norm, cmap=land_cmap)
+        elevation_mappable.set_array(elevation)
+        colorbar = fig.colorbar(elevation_mappable, ax=ax, orientation="vertical", fraction=0.046, pad=0.04)
+        colorbar.set_label("Elevation")
+
+        ax.set_xlim(0, self.width)
+        ax.set_ylim(0, self.height)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(alpha=0.15, color="white")
+        ax.set_title(title if title else "Perlin Terrain")
+
+        if finalize:
+            self.finalize_plot(fig, output_path, show)
+        return fig, ax
 
     def plot_result(
         self,
@@ -309,81 +514,16 @@ class TerrainFieldClass(BaseFieldClass):
         show: bool = True,
         planner_name: str = "RRT",
         title: Optional[str] = None,
+        grade_limit: float | None = None,
     ) -> None:
-        terrain = self.terrain if self.terrain is not None else self.generate_field()
-        elevation = self.elevation if self.elevation is not None else self.remap_elevation(terrain)
-        water_mask, steep_grade_mask, _ = (
-            self.generate_obstacle_layers()
-            if self.water_mask is None or self.steep_grade_mask is None
-            else (self.water_mask, self.steep_grade_mask, self.obstacle_mask)
+        self.render_planner_result(
+            nodes=nodes,
+            path=path,
+            start=start,
+            goal=goal,
+            output_path=output_path,
+            show=show,
+            planner_name=planner_name,
+            title=title,
+            max_grade=grade_limit,
         )
-        cmap = self.make_terrain_colormap()
-        obstacle_cmap = self.make_obstacle_colormap()
-        ls = mcolors.LightSource(azdeg=315, altdeg=35)
-        hillshade = ls.shade(terrain, cmap=cmap, vert_exag=3.0, blend_mode="soft")
-
-        fig, ax = plt.subplots(figsize=(8, 8))
-        ax.imshow(hillshade, origin="lower", interpolation="bilinear")
-
-        elevation_norm = mcolors.Normalize(vmin=0.0, vmax=self.max_elevation)
-        elevation_mappable = plt.cm.ScalarMappable(norm=elevation_norm, cmap=cmap)
-        elevation_mappable.set_array(elevation)
-        colorbar = fig.colorbar(elevation_mappable, ax=ax, orientation="vertical", fraction=0.046, pad=0.04)
-        colorbar.set_label("Elevation")
-
-        # Overlay obstacle layers using a shared grayscale palette.
-        water_overlay = np.ma.masked_where(~water_mask, water_mask)
-        steep_overlay = np.ma.masked_where(~steep_grade_mask, steep_grade_mask)
-        ax.imshow(water_overlay, origin="lower", cmap=obstacle_cmap, alpha=0.50, interpolation="nearest")
-        ax.imshow(steep_overlay, origin="lower", cmap=obstacle_cmap, alpha=0.50, interpolation="nearest")
-
-        # Add diagonal hatching to make obstacle regions readable in grayscale.
-        water_levels = [0.5, 1.5]
-        steep_levels = [0.5, 1.5]
-        ax.contourf(
-            water_mask.astype(float),
-            levels=water_levels,
-            colors="none",
-            hatches=["///"],
-            origin="lower",
-        )
-        ax.contourf(
-            steep_grade_mask.astype(float),
-            levels=steep_levels,
-            colors="none",
-            hatches=["\\\\"],
-            origin="lower",
-        )
-
-        if nodes:
-            for node in nodes:
-                if getattr(node, "parent", None) is None:
-                    continue
-                parent = nodes[node.parent]
-                ax.plot([parent.x, node.x], [parent.y, node.y], color="white", linewidth=0.6, alpha=0.5)
-
-        if path:
-            xs = [p[0] for p in path]
-            ys = [p[1] for p in path]
-            ax.plot(xs, ys, color="#e63946", linewidth=2.2, label=f"{planner_name} path")
-
-        ax.scatter(start[0], start[1], c="tab:green", s=80, label="start", zorder=5)
-        ax.scatter(goal[0], goal[1], c="tab:blue", s=80, label="goal", zorder=5)
-        if title:
-            ax.set_title(title)
-        else:
-            ax.set_title(f"Perlin Terrain {planner_name} Visualization")
-        ax.set_xlim(0, self.width)
-        ax.set_ylim(0, self.height)
-        ax.set_aspect("equal", adjustable="box")
-        ax.legend(loc="upper left")
-        ax.grid(alpha=0.15, color="white")
-
-        if output_path is not None:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(output_path, dpi=180, bbox_inches="tight")
-
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
