@@ -94,6 +94,7 @@ class BaseFieldClass(ABC):
         ax: object,
         *,
         nodes: list[object],
+        roadmap_edges: list[tuple[int, int]] | None = None,
         path: list[np.ndarray] | None,
         start: tuple[float, float],
         goal: tuple[float, float],
@@ -102,17 +103,29 @@ class BaseFieldClass(ABC):
         tree_style = self.planner_tree_style()
         path_style = self.planner_path_style()
 
-        for node in nodes:
-            if getattr(node, "parent", None) is None:
-                continue
-            parent = nodes[node.parent]
-            ax.plot(
-                [parent.x, node.x],
-                [parent.y, node.y],
-                color=tree_style["color"],
-                linewidth=tree_style["linewidth"],
-                alpha=tree_style["alpha"],
-            )
+        if roadmap_edges:
+            for i, j in roadmap_edges:
+                p = nodes[i]
+                q = nodes[j]
+                ax.plot(
+                    [p.x, q.x],
+                    [p.y, q.y],
+                    color=tree_style["color"],
+                    linewidth=tree_style["linewidth"],
+                    alpha=tree_style["alpha"],
+                )
+        else:
+            for node in nodes:
+                if getattr(node, "parent", None) is None:
+                    continue
+                parent = nodes[node.parent]
+                ax.plot(
+                    [parent.x, node.x],
+                    [parent.y, node.y],
+                    color=tree_style["color"],
+                    linewidth=tree_style["linewidth"],
+                    alpha=tree_style["alpha"],
+                )
 
         if path:
             xs = [point[0] for point in path]
@@ -136,6 +149,7 @@ class BaseFieldClass(ABC):
         self,
         *,
         nodes: list[object],
+        roadmap_edges: list[tuple[int, int]] | None = None,
         path: list[np.ndarray] | None,
         start: tuple[float, float],
         goal: tuple[float, float],
@@ -151,6 +165,7 @@ class BaseFieldClass(ABC):
         self.overlay_planner_state(
             ax,
             nodes=nodes,
+            roadmap_edges=roadmap_edges,
             path=path,
             start=start,
             goal=goal,
@@ -251,6 +266,7 @@ class ToyFieldClass(BaseFieldClass):
     ) -> None:
         self.render_planner_result(
             nodes=nodes,
+            roadmap_edges=None,
             path=path,
             start=start,
             goal=goal,
@@ -518,6 +534,7 @@ class TerrainFieldClass(BaseFieldClass):
     ) -> None:
         self.render_planner_result(
             nodes=nodes,
+            roadmap_edges=None,
             path=path,
             start=start,
             goal=goal,

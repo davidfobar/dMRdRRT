@@ -27,10 +27,22 @@ def _overlay_agent_constraints(agent: Agent, ax: object) -> None:
 
 def _overlay_agent_planner_state(agent: Agent, ax: object, planner_name: str) -> None:
     nodes = agent.planner.nodes if agent.planner is not None else []
+    roadmap_edges = getattr(agent.planner, "roadmap_edges", []) if agent.planner is not None else []
     tree_style = agent.field.planner_tree_style()
     path_style = agent.field.planner_path_style()
 
-    if nodes:
+    if nodes and roadmap_edges:
+        for i, j in roadmap_edges:
+            p = nodes[i]
+            q = nodes[j]
+            ax.plot(
+                [p.x, q.x],
+                [p.y, q.y],
+                color=tree_style["color"],
+                linewidth=tree_style["linewidth"],
+                alpha=tree_style["alpha"],
+            )
+    elif nodes:
         for node in nodes:
             if node.parent is None:
                 continue
