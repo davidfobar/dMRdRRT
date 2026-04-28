@@ -9,6 +9,9 @@ import matplotlib.colors as mcolors
 from matplotlib.patches import Circle
 import numpy as np
 from noise import pnoise2
+#Robbie Push ->Added Some libraries
+from matplotlib.animation import FuncAnimation, PillowWriter
+import numpy as np
 
 
 class BaseFieldClass(ABC):
@@ -544,3 +547,175 @@ class TerrainFieldClass(BaseFieldClass):
             title=title,
             max_grade=grade_limit,
         )
+
+#Robbie Push -> Render multiagent paths
+    def render_multi_agent_result(
+        self,
+        *,
+        prm,
+        robot_paths,
+        start_states,
+        goal_states,
+        output_path=None,
+        show=True,
+        title="MRdRRT Multi-Agent",
+    ):
+        fig, ax = self.plot(show=False, title=title, finalize=False)
+
+        # Draw PRM roadmap (optional but matches PRM visuals)
+        for i, j in prm.roadmap_edges:
+            p = prm.nodes[i]
+            q = prm.nodes[j]
+            ax.plot(
+                [p.x, q.x],
+                [p.y, q.y],
+                color="0.75",
+                linewidth=0.7,
+                alpha=0.6,
+            )
+
+        colors = ["tab:blue", "tab:red", "tab:green", "tab:purple", "tab:brown", "tab:orange", "tab:pink"]
+        
+        for i, path in enumerate(robot_paths):
+            xs = [p[0] for p in path]
+            ys = [p[1] for p in path]
+
+            ax.plot(
+                xs,
+                ys,
+                color=colors[i % len(colors)],
+                linewidth=2.2,
+                label=f"Robot {i+1}",
+            )
+
+            ax.scatter(xs[0], ys[0], c="green", s=60)
+            ax.scatter(xs[-1], ys[-1], c="blue", s=60)
+            
+        for i, coords in enumerate(goal_states):
+            # Draw goal point star
+            ax.scatter(coords[0], coords[1], c=colors[i% len(colors)], marker='*', s=250, zorder=5, edgecolors='black')
+        
+        ax.legend()
+        self.finalize_plot(fig, output_path, show)
+
+
+    def animate_multi_agent_result(
+        self,
+        *,
+        prm,
+        robot_paths,
+        start_states,
+        goal_states,
+        output_path=None,    # .gif or .mp4
+        show=True,
+        title="MRdRRT Multi-Agent",
+        interval=300,        # ms per frame
+        trail_length=15,      # how many past positions to show as faded trail
+        comm_range,
+    ):
+        fig, ax = self.plot(show=False, title=title, finalize=False)
+
+        # Draw static PRM roadmap
+        for i, j in prm.roadmap_edges:
+            p, q = prm.nodes[i], prm.nodes[j]
+            ax.plot([p.x, q.x], [p.y, q.y], color="0.75", linewidth=0.7, alpha=0.6)
+
+        colors = ["tab:blue", "tab:red", "tab:green", "tab:purple",
+                "tab:brown", "tab:orange", "tab:pink"]
+
+        # Draw faded full paths as a guide
+        for i, path in enumerate(robot_paths):
+            xs = [p[0] for p in path]
+            ys = [p[1] for p in path]
+            ax.plot(xs, ys, color=colors[i % len(colors)], linewidth=1.0,
+                    alpha=0.2, linestyle="--")
+
+        # Draw start markers
+        for i, path in enumerate(robot_paths):
+            ax.scatter(path[0][0], path[0][1], c="green", s=80, zorder=5,
+                    edgecolors="black")
+
+        # Draw goal stars
+        for i, coords in enumerate(goal_states):
+            ax.scatter(coords[0], coords[1], c=colors[i % len(colors)],
+                    marker="*", s=250, zorder=5, edgecolors="black")
+
+        n_agents = len(robot_paths)
+        max_steps = max(len(p) for p in robot_paths)
+
+        # Artists we update each frame: trail lines + robot dot + step counter
+        trails   = [ax.plot([], [], color=colors[i % len(colors)], linewidth=2.2,
+                            alpha=0.8, label=f"Robot {i+1}")[0]
+                    for i in range(n_agents)]
+        dots     = [ax.plot([], [], "o", color=colors[i % len(colors)],
+                            markersize=10, zorder=6)[0]
+                    for i in range(n_agents)]
+        counter  = ax.text(0.02, 0.97, "", transform=ax.transAxes,
+                        fontsize=10, va="top",
+                        bbox=dict(boxstyle="round", fc="white", alpha=0.7))
+        # After your existing dots/trails setup, add:
+        comm_circles = [
+            plt.Circle(
+                (path[0][0], path[0][1]),  # initial position
+                comm_range,
+                color=colors[i % len(colors)],
+                fill=False,
+                lw=2,
+                alpha=1,
+                linestyle="--",
+                zorder=5,
+            )
+            for i, path in enumerate(robot_paths)
+        ]
+        for c in comm_circles:
+            ax.add_patch(c)
+        ax.legend(loc="upper right")
+        
+        def init():
+            for trail, dot in zip(trails, dots):
+                trail.set_data([], [])
+                dot.set_data([], [])
+            counter.set_text("")
+            return trails + dots + [counter]
+
+        def update(frame):
+            for i, (path, trail, dot) in enumerate(zip(robot_paths, trails, dots)):
+                # Clamp frame to last position if this robot's path is shorter
+                step = min(frame, len(path) - 1)
+
+                # Trail: last `trail_length` positions
+                trail_start = max(0, step - trail_length)
+                xs = [p[0] for p in path[trail_start : step + 1]]
+                ys = [p[1] for p in path[trail_start : step + 1]]
+                trail.set_data(xs, ys)
+
+                # Robot dot at current position
+                dot.set_data([path[step][0]], [path[step][1]])
+                # Move each circle to follow its robot
+                for i, (path, circle) in enumerate(zip(robot_paths, comm_circles)):
+                    step = min(frame, len(path) - 1)
+                    circle.center = (path[step][0], path[step][1])
+
+            counter.set_text(f"Step {frame + 1} / {max_steps}")
+            return trails + dots + [counter]
+
+        anim = FuncAnimation(
+            fig,
+            update,
+            frames=max_steps,
+            init_func=init,
+            interval=interval,
+            blit=True,
+        )
+
+        if output_path:
+            if output_path.endswith(".gif"):
+                anim.save(output_path, writer=PillowWriter(fps=1000 // interval))
+            elif output_path.endswith(".mp4"):
+                anim.save(output_path, writer="ffmpeg", fps=1000 // interval)
+            print(f"Saved animation to {output_path}")
+
+        if show:
+            plt.show()
+
+        return anim  # keep reference alive to prevent GC freeze

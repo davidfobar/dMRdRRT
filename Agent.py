@@ -7,6 +7,7 @@ import numpy as np
 from FieldClass import BaseFieldClass
 from PRM import PRMQueryParameters, PRMQueryResult, PRMRoadmap
 from RRT import RRTParameters, RRTPlanner
+from MRdRRT import MRParameters # Robbie Push added MRdRRT
 
 
 @dataclass(slots=True)
@@ -50,6 +51,7 @@ class Agent:
         field: BaseFieldClass,
         start: tuple[float, float],
         rrt_params: RRTParameters | None = None,
+        mr_params: MRParameters | None = None, # Robbie Push added MR_params
         prm_roadmap: PRMRoadmap | None = None,
         planner_type: str = "rrt",
         max_grade: float = 15.0,
