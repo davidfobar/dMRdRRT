@@ -13,17 +13,24 @@ def plot_agent(
     show: bool = True,
     planner_name: str = "RRT",
     title: str | None = None,
+    include_grade_obstacles: bool = True,
 ) -> None:
     """Render a field plus one agent's obstacle overlays and planner state."""
     field_title = title if title is not None else agent.field.default_agent_plot_title(planner_name)
 
     fig, ax = agent.field.plot(show=False, title=field_title, finalize=False)
-    _overlay_agent_constraints(agent, ax)
+    _overlay_agent_constraints(agent, ax, include_grade_obstacles=include_grade_obstacles)
     _overlay_agent_planner_state(agent, ax, planner_name)
     agent.field.finalize_plot(fig, output_path, show)
 
-def _overlay_agent_constraints(agent: Agent, ax: object) -> None:
-    agent.field.overlay_obstacle_regions(ax, max_grade=agent.max_grade)
+def _overlay_agent_constraints(
+    agent: Agent,
+    ax: object,
+    *,
+    include_grade_obstacles: bool,
+) -> None:
+    max_grade = agent.max_grade if include_grade_obstacles else None
+    agent.field.overlay_obstacle_regions(ax, max_grade=max_grade)
 
 def _overlay_agent_planner_state(agent: Agent, ax: object, planner_name: str) -> None:
     nodes = agent.planner.nodes if agent.planner is not None else []
