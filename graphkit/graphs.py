@@ -53,6 +53,9 @@ class SwarmGraph:
     def neighbors(self, i: int):
         return [int(j) for j in self.graph.neighbors(i) if j != i]
 
+    def as_nx(self):
+        return self.graph
+
     def degree(self, i: int):
         return int(self.as_nx().degree(i))
 
