@@ -1,71 +1,46 @@
 # dMRdRRT
 
-Toy implementation of sampling-based motion planning for 2D fields.
+This project runs a distributed multi-robot planning simulation using MPI. The main entry point is `r_robust_MR_RRT.py`, which simulates multiple agents moving toward assigned goals while trying to preserve communication connectivity.
 
-Currently supported planners:
+## Requirements
 
-- RRT
-- RRT*
-- PRM (Probabilistic Roadmap)
+- Python 3.12+
+- `uv`
+- An MPI runtime that provides `mpiexec`
 
-Both toy obstacle fields and Perlin terrain fields support plotting planner state
-(RRT tree or PRM roadmap) and final path overlays.
+## Installation
 
-## Run the demo
+The Python dependencies are defined in `pyproject.toml` and should be installed with `uv sync` called in the same directory as `pyproject.toml`.
 
-```bash
-python main.py
-```
+This creates a local virtual environment at `.venv/`.
 
-This runs a deterministic toy planning problem with circular obstacles, prints path stats, and saves:
+## Running the Simulation
 
-- `images/rrt_toy_solution.png`
+The simulation is designed to be launched through MPI. The examples below use 8 ranks because the current script defines 8 goal locations.
 
-To open the plot window while also saving the image:
+Run with replanning enabled:
 
 ```bash
-python main.py --show
+mpiexec -n 8 .venv/bin/python r_robust_MR_RRT.py
 ```
 
-To enable RRT* (cost-based parent selection + local rewiring):
+Run with replanning disabled:
 
 ```bash
-python main.py --rrt-star
+mpiexec -n 8 .venv/bin/python r_robust_MR_RRT.py --no-replan
 ```
 
-## PRM usage (in code / notebook)
+The script writes simulation frames into the `sim/` directory.
 
-```python
-from Agent import Agent
-from PRM import PRMParameters, PRMRoadmap
+## Creating an Animation
 
-roadmap = PRMRoadmap(
-	space=field,
-	params=PRMParameters(
-		n_samples=500,
-		k_neighbors=14,
-		connection_radius=24.0,
-		max_build_attempts=3,
-		seed=7,
-	),
-)
-roadmap.build()  # persistent graph, reused for many queries/agents
+After the simulation finishes, you can stitch the saved frames into an animation with the helper script in `sim/`:
 
-agent = Agent(
-	field,
-	start=(8.0, 8.0),
-	planner_type="prm",
-	prm_roadmap=roadmap,
-)
-path = agent.plan_to((92.0, 90.0))
-
-# Another agent can reuse the same roadmap.
-other_agent = Agent(field, start=(15.0, 12.0), planner_type="prm", prm_roadmap=roadmap)
-other_path = other_agent.plan_to((84.0, 70.0))
-
-# If needed later, swap to a different shared roadmap.
-other_agent.update_prm_roadmap(roadmap)
+```bash
+.venv/bin/python sim/stitch_sim_frames_to_gif.py
 ```
 
-Use `utils.visualization.plot_agent(agent, planner_name="PRM")` to render the
-roadmap and resulting path.
+## Project Notes
+
+- The `agent` and `graphkit` contains logic that is shared with other projects and experiments outside the scope of this repository. Some methods or utilities in that class may therefore appear more general than what this specific project strictly requires.
+- The current simulation setup assumes the number of MPI ranks matches the number of hard-coded endpoints in `r_robust_MR_RRT.py`.

@@ -42,7 +42,6 @@ STEP_DIST = 5.0  # metres per simulation step
 K_LOOKAHEAD = 40
 REPLAN_BUFFER_K = 8  # replan when violation predicted within this many steps
 REPLAN_COOLDOWN = 15
-PLAN_TO_GOAL_IF_ENDS_IN_RANGE = True
 CURR_POS_TAG = MPITags.CONTROL
 LOOKAHEAD_TAG = MPITags.CONTROL + 1
 DEGREE_TAG = MPITags.CONTROL + 2
@@ -74,15 +73,14 @@ REPLAN_MAX_DIST = 0.75 * terrain_agent.comms_range
 terrain_path = terrain_agent.plan_to(end_points[rank])
 
 # reduce max_iters for replanning
-terrain_agent.rrt_params.max_iters = 5000
+terrain_agent.rrt_params.max_iters = 10000
 
+# delete frames from previous runs (if any)
 sim_dir = Path("sim")
 if rank == 0:
     sim_dir.mkdir(parents=True, exist_ok=True)
     for f in sim_dir.glob("frame*.png"):
         f.unlink()
-
-
 
 if terrain_path is not None and len(terrain_path) > 1:
     waypoints = np.array(terrain_path)
@@ -101,11 +99,7 @@ for r in range(size):
         )
     comm.Barrier()
 
-# ---------------------------------------------------------------------------
-# Time-based simulation: all agents move simultaneously at STEP_DIST per tick.
-# Each rank walks its own waypoints; all ranks step in lockstep via Barrier.
-# ---------------------------------------------------------------------------
-
+# interpolate along the path at fixed step sizes for smooth simulation
 def _advance_along_path(waypoints, current_pos, step_dist):
     """
     Walk `step_dist` metres along `waypoints` starting from `current_pos`.
@@ -130,7 +124,6 @@ def _advance_along_path(waypoints, current_pos, step_dist):
 
     done = len(wpts) == 0
     return pos, np.array(wpts), done
-
 
 def _compute_k_lookahead(waypoints, current_pos, step_dist, k):
     """
@@ -172,6 +165,7 @@ step = 0
 while True:
     comm.Barrier()  # all ranks begin this step together
 
+    # If already done, just stay put and keep sharing that fact with neighbors.
     if not done:
         planned_next_pos, planned_next_waypoints, planned_done = _advance_along_path(
             sim_waypoints, terrain_agent.position, STEP_DIST
@@ -181,7 +175,7 @@ while True:
         planned_next_waypoints = sim_waypoints
         planned_done = True
 
-    # Neighbor comms sync: share current position and K-step lookahead path.
+    # Neighbor comms sync: share current position, lookahead, and degree for this step
     n_neighbors = len(neighbors)
     my_lookahead = _compute_k_lookahead(
         sim_waypoints,
@@ -215,143 +209,174 @@ while True:
             comm, degree_send, tag=DEGREE_TAG
         )
     else:
+        # fall back if no neighbors (shouldn't happen in this graph, but just in case)
         neighbor_curr_positions = torch.empty((0, 2), device=terrain_agent.device, dtype=terrain_agent.dtype)
         neighbor_lookahead_paths = torch.empty((0, K_LOOKAHEAD, 2), device=terrain_agent.device, dtype=terrain_agent.dtype)
         neighbor_degrees = torch.empty((0, 1), device=terrain_agent.device, dtype=terrain_agent.dtype)
 
+    ########################################################################
+    # Replanning logic:
+    #   - Check if any neighbor's predicted lookahead path violates comms range within the next K steps.
+    #   - If so, only the "more responsible" agent (lower degree, or tie-break by rank) replans.
+    #   - Replan by trying to rendezvous at a point along the predicted path of the neighbor that would violate comms, then continue to goal.
+    #   - To keep things simple, the agent only tries to replan once per predicted violation, and waits at least REPLAN_COOLDOWN steps between replans.
+    ########################################################################
     out_of_range_reports = []
     replan_candidate_idx = None
     replan_candidate_key = None
-    if n_neighbors > 0:
-        neighbor_lookahead_np = neighbor_lookahead_paths.detach().cpu().numpy()
-        neighbor_degrees_np = neighbor_degrees.detach().cpu().numpy()
-        for i, nbr in enumerate(neighbors):
-            lookahead_dists = np.linalg.norm(
-                neighbor_lookahead_np[i] - my_lookahead,
-                axis=1,
-            )
-            max_predicted_dist = float(np.max(lookahead_dists))
-            out_of_range_idx = np.where(lookahead_dists > terrain_agent.comms_range)[0]
-            soft_trigger_idx = np.where(lookahead_dists > REPLAN_MAX_DIST)[0]
-            if out_of_range_idx.size > 0:
-                first_idx = int(out_of_range_idx[0])
-                out_of_range_reports.append(
-                    (
-                        nbr,
-                        first_idx + 1,
-                        float(lookahead_dists[first_idx]),
-                        max_predicted_dist,
-                    )
-                )
-
-            first_violation_idx = int(out_of_range_idx[0]) if out_of_range_idx.size > 0 else None
-            first_soft_trigger_idx = int(soft_trigger_idx[0]) if soft_trigger_idx.size > 0 else None
-            early_trigger = first_soft_trigger_idx is not None
-            late_trigger = first_violation_idx is not None and (first_violation_idx + 1) <= REPLAN_BUFFER_K
-
-            if early_trigger or late_trigger:
-                nbr_degree = int(round(float(neighbor_degrees_np[i, 0])))
-                i_should_replan = (local_degree < nbr_degree) or (
-                    local_degree == nbr_degree and rank < nbr
-                )
-
-                if i_should_replan:
-                    trigger_step = (first_violation_idx + 1) if late_trigger else (first_soft_trigger_idx + 1)
-                    trigger_priority = 0 if late_trigger else 1
-                    trigger_metric = float(lookahead_dists[first_violation_idx]) if late_trigger else -max_predicted_dist
-                    candidate_key = (trigger_priority, trigger_step, trigger_metric)
-                    if replan_candidate_key is None or candidate_key < replan_candidate_key:
-                        replan_candidate_key = candidate_key
-                        replan_candidate_idx = i
-
-    replan_needed = replan_candidate_idx is not None and not DISABLE_REPLAN
     did_replan = False
-    if replan_needed and not done and (step - last_replan_step) >= REPLAN_COOLDOWN:
-        neighbor_lookahead_np = neighbor_lookahead_paths.detach().cpu().numpy()
-        replan_neighbor = neighbors[replan_candidate_idx]
+    if not DISABLE_REPLAN:
 
-        first_k = int(replan_candidate_key[1] - 1)
-        first_k = max(0, min(first_k, K_LOOKAHEAD - 1))
-        my_predicted_pos = my_lookahead[first_k]
-        nbr_predicted_pos = neighbor_lookahead_np[replan_candidate_idx][first_k]
-
-        nbr_degree = int(round(float(neighbor_degrees_np[replan_candidate_idx, 0])))
-        total_degree = max(1, local_degree + nbr_degree)
-        alpha = nbr_degree / total_degree
-        rendezvous = (1.0 - alpha) * my_predicted_pos + alpha * nbr_predicted_pos
-
-        # Preserve the current plan up to just before predicted violation.
-        prefix_positions = []
-        anchor_pos = terrain_agent.position.copy()
-        anchor_waypoints = np.array(sim_waypoints)
-        anchor_done = len(anchor_waypoints) == 0
-        for _ in range(first_k):
-            if anchor_done:
-                break
-            anchor_pos, anchor_waypoints, anchor_done = _advance_along_path(
-                anchor_waypoints,
-                anchor_pos,
-                STEP_DIST,
-            )
-            prefix_positions.append(anchor_pos.copy())
-
-        original_pos = terrain_agent.position.copy()
-        goals_within_comms = np.linalg.norm(
-            np.array(end_points[rank], dtype=float) - np.array(end_points[replan_neighbor], dtype=float)
-        ) <= terrain_agent.comms_range
-
-        terrain_agent.position = anchor_pos.astype(float)
-        if PLAN_TO_GOAL_IF_ENDS_IN_RANGE and goals_within_comms:
-            direct_path_to_goal = terrain_agent.plan_to(end_points[rank])
-            terrain_agent.position = original_pos
-
-            if direct_path_to_goal is not None and len(direct_path_to_goal) > 1:
-                stitched_parts = []
-                if len(prefix_positions) > 0:
-                    stitched_parts.append(np.array(prefix_positions, dtype=float))
-                stitched_parts.append(np.array(direct_path_to_goal, dtype=float)[1:])
-
-                sim_waypoints = np.concatenate(stitched_parts, axis=0)
-                planned_next_pos, planned_next_waypoints, planned_done = _advance_along_path(
-                    sim_waypoints, terrain_agent.position, STEP_DIST
+        if n_neighbors > 0:
+            neighbor_lookahead_np = neighbor_lookahead_paths.detach().cpu().numpy()
+            neighbor_degrees_np = neighbor_degrees.detach().cpu().numpy()
+            for i, nbr in enumerate(neighbors):
+                # Compare each predicted step between agent and neighbors
+                lookahead_dists = np.linalg.norm(
+                    neighbor_lookahead_np[i] - my_lookahead,
+                    axis=1,
                 )
-                last_replan_step = step
-                did_replan = True
-        else:
-            rendezvous_goal = tuple(rendezvous.astype(int))
-            path_to_rendezvous = terrain_agent.plan_to(rendezvous_goal)
-            if path_to_rendezvous is not None and len(path_to_rendezvous) > 1:
-                terrain_agent.position = rendezvous.astype(float)
-                path_to_goal = terrain_agent.plan_to(end_points[rank])
+                max_predicted_dist = float(np.max(lookahead_dists))
+                out_of_range_idx = np.where(lookahead_dists > 0.8 * terrain_agent.comms_range)[0]
+
+                # build a report to log violations
+                if out_of_range_idx.size > 0:
+                    first_idx = int(out_of_range_idx[0])
+                    out_of_range_reports.append(
+                        (
+                            nbr,
+                            first_idx + 1,
+                            float(lookahead_dists[first_idx]),
+                            max_predicted_dist,
+                        )
+                    )
+
+                # If there is a predicted violation, decide whether this agent owns the
+                # replanning responsibility (vs. the neighbor) by degree/rank tie-break.
+                first_violation_step_idx = int(out_of_range_idx[0]) if out_of_range_idx.size > 0 else None
+                if first_violation_step_idx is not None and (step - last_replan_step) >= REPLAN_COOLDOWN:
+                    # Lower-degree nodes own replanning; rank breaks ties.
+                    neighbor_degree = int(round(float(neighbor_degrees_np[i, 0])))
+                    this_agent_should_replan = (local_degree < neighbor_degree) or (local_degree == neighbor_degree and rank < nbr)
+
+                    if this_agent_should_replan:
+                        distance_at_violation = float(lookahead_dists[first_violation_step_idx])
+                        replan_priority_key = (first_violation_step_idx, distance_at_violation)
+
+                        # Update neighbor replan candidate if either wins on priority:
+                        #   1) earliest violation step
+                        #   2) smallest violation distance at that step
+                        if replan_candidate_key is None or replan_priority_key < replan_candidate_key:
+                            replan_candidate_key = replan_priority_key
+                            replan_candidate_idx = i
+
+        replan_needed = replan_candidate_idx is not None
+        if replan_needed and not done:
+            # get the neighbor's predicted path that we are trying to rendezvous with
+            neighbor_lookahead_np = neighbor_lookahead_paths.detach().cpu().numpy()
+            replan_neighbor = neighbors[replan_candidate_idx]
+
+            # Index of the first predicted violation for the selected neighbor.
+            violation_lookahead_idx = int(replan_candidate_key[0])
+            violation_lookahead_idx = max(0, min(violation_lookahead_idx, K_LOOKAHEAD - 1))
+            my_predicted_pos = my_lookahead[violation_lookahead_idx]
+            neighbor_predicted_pos = neighbor_lookahead_np[replan_candidate_idx][violation_lookahead_idx]
+
+            # Compute a degree-weighted rendezvous point at the violation step.
+            # Higher neighbor degree pulls the point closer to the neighbor trajectory.
+            neighbor_degree = int(round(float(neighbor_degrees_np[replan_candidate_idx, 0])))
+            total_pair_degree = max(1, local_degree + neighbor_degree)
+            neighbor_weight = neighbor_degree / total_pair_degree
+            rendezvous_point = (1.0 - neighbor_weight) * my_predicted_pos + neighbor_weight * neighbor_predicted_pos
+
+            # Preserve the currently committed path prefix up to the violation step.
+            preserved_prefix_positions = []
+            replan_anchor_pos = terrain_agent.position.copy()
+            replan_anchor_waypoints = np.array(sim_waypoints)
+            anchor_path_exhausted = len(replan_anchor_waypoints) == 0
+            for _ in range(violation_lookahead_idx):
+                if anchor_path_exhausted:
+                    break
+                replan_anchor_pos, replan_anchor_waypoints, anchor_path_exhausted = _advance_along_path(
+                    replan_anchor_waypoints,
+                    replan_anchor_pos,
+                    STEP_DIST,
+                )
+                preserved_prefix_positions.append(replan_anchor_pos.copy())
+
+            # Save and restore planner state because plan_to uses terrain_agent.position.
+            original_agent_pos = terrain_agent.position.copy()
+
+            # determine if agent is within comms range of the end goal at the violation step 
+            # if so, can replan directly to goal instead of rendezvous + goal
+            goals_within_comms_range = np.linalg.norm(
+                np.array(end_points[rank], dtype=float) - np.array(end_points[replan_neighbor], dtype=float)
+            ) <= terrain_agent.comms_range
+
+            # we have to temporarily move the agent to the anchor position to plan from there,
+            # it would be cleaner if the agent could plan from an arbitrary state without modifying its own position
+            terrain_agent.position = replan_anchor_pos.astype(float)
+            if goals_within_comms_range:
+                # If the final goals are still mutually reachable, skip the rendezvous
+                # detour and replan directly from the anchor point to this agent's goal.
+                direct_goal_path = terrain_agent.plan_to(end_points[rank])
+                terrain_agent.position = original_agent_pos
+
+                if direct_goal_path is not None and len(direct_goal_path) > 1:
+                    # Keep original prefix, then splice in a fresh path to goal.
+                    stitched_path_segments = []
+                    if len(preserved_prefix_positions) > 0:
+                        stitched_path_segments.append(np.array(preserved_prefix_positions, dtype=float))
+                    stitched_path_segments.append(np.array(direct_goal_path, dtype=float)[1:])
+
+                    sim_waypoints = np.concatenate(stitched_path_segments, axis=0)
+                    # Refresh the immediate next simulated move from the new waypoint list.
+                    planned_next_pos, planned_next_waypoints, planned_done = _advance_along_path(
+                        sim_waypoints, terrain_agent.position, STEP_DIST
+                    )
+                    last_replan_step = step
+                    did_replan = True
             else:
-                path_to_goal = None
-            terrain_agent.position = original_pos
+                # Otherwise, first plan to the rendezvous point, then from rendezvous to goal.
+                rendezvous_goal = tuple(rendezvous_point.astype(int))
+                rendezvous_path = terrain_agent.plan_to(rendezvous_goal)
+                if rendezvous_path is not None and len(rendezvous_path) > 1:
+                    # The second planning leg starts from the rendezvous location itself.
+                    terrain_agent.position = rendezvous_point.astype(float)
+                    goal_path = terrain_agent.plan_to(end_points[rank])
+                else:
+                    goal_path = None
+                terrain_agent.position = original_agent_pos
 
-            if path_to_rendezvous is not None and len(path_to_rendezvous) > 1 and path_to_goal is not None and len(path_to_goal) > 1:
-                stitched_parts = []
-                if len(prefix_positions) > 0:
-                    stitched_parts.append(np.array(prefix_positions, dtype=float))
-                stitched_parts.append(np.array(path_to_rendezvous, dtype=float)[1:])
-                stitched_parts.append(np.array(path_to_goal, dtype=float)[1:])
+                if rendezvous_path is not None and len(rendezvous_path) > 1 and goal_path is not None and len(goal_path) > 1:
+                    # Keep original prefix, then append rendezvous leg and goal leg.
+                    stitched_path_segments = []
+                    if len(preserved_prefix_positions) > 0:
+                        stitched_path_segments.append(np.array(preserved_prefix_positions, dtype=float))
+                    stitched_path_segments.append(np.array(rendezvous_path, dtype=float)[1:])
+                    stitched_path_segments.append(np.array(goal_path, dtype=float)[1:])
 
-                sim_waypoints = np.concatenate(stitched_parts, axis=0)
-                planned_next_pos, planned_next_waypoints, planned_done = _advance_along_path(
-                    sim_waypoints, terrain_agent.position, STEP_DIST
-                )
-                last_replan_step = step
-                did_replan = True
+                    sim_waypoints = np.concatenate(stitched_path_segments, axis=0)
+                    # Refresh the immediate next simulated move from the new waypoint list.
+                    planned_next_pos, planned_next_waypoints, planned_done = _advance_along_path(
+                        sim_waypoints, terrain_agent.position, STEP_DIST
+                    )
+                    last_replan_step = step
+                    did_replan = True
 
+    # update state for this iteration
     if not done:
         terrain_agent.position = planned_next_pos
         sim_waypoints = planned_next_waypoints
         done = planned_done
 
+    # prepare the path for visualization
     if sim_waypoints.size > 0:
         planned_path_for_plot = np.vstack([terrain_agent.position.copy(), sim_waypoints.copy()])
     else:
         planned_path_for_plot = np.array([terrain_agent.position.copy()])
 
-    # Only flag a current comms violation (not a predicted future one)
+    # Determine if agent is out of comms range with any neighbor within the next K_LOOKAHEAD steps, and share that info for visualization.
     if n_neighbors > 0:
         curr_nbr_np = neighbor_curr_positions.detach().cpu().numpy()
         curr_dists = np.linalg.norm(curr_nbr_np - terrain_agent.position, axis=1)
@@ -363,6 +388,7 @@ while True:
         root=0,
     )
 
+    # Visualization on rank 0 after gathering all states.
     if rank == 0:
         gathered_state.sort(key=lambda x: x[0])
         positions = np.array([entry[1] for entry in gathered_state], dtype=float)
@@ -429,7 +455,7 @@ while True:
                     f"max_k_distance={max_dist:.2f} "
                     f"> comms_range={terrain_agent.comms_range:.2f}"
                 )
-            if did_replan and not done:
+            if not DISABLE_REPLAN and did_replan and not done:
                 print(
                     f"  [rank {rank}] replanned due to lookahead violation within "
                     f"REPLAN_BUFFER_K={REPLAN_BUFFER_K}"
