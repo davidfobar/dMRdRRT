@@ -16,8 +16,29 @@ from mpi4py import MPI
 
 _parser = argparse.ArgumentParser()
 _parser.add_argument("--no-replan", action="store_true", help="Disable all replanning")
+_parser.add_argument("--seed", type=int, default=42, help="Base RNG seed for terrain and planners")
+_parser.add_argument("--no-plot", action="store_true", help="Skip per-step frames and connectivity plot (faster for batch runs)")
+_parser.add_argument("--metrics-out", type=str, default=None, help="Path to write metrics (appended as JSONL); defaults to sim/metrics.jsonl")
 _args, _ = _parser.parse_known_args()
 DISABLE_REPLAN = _args.no_replan
+BASE_SEED = _args.seed
+NO_PLOT = _args.no_plot
+METRICS_OUT = _args.metrics_out
+
+
+def fiedler_value(positions: np.ndarray, edges: list[tuple[int, int]], comms_range: float) -> float:
+    """
+    Second-smallest eigenvalue of the binary communication graph Laplacian.
+    Returns 0.0 when the graph is disconnected, positive otherwise.
+    """
+    n = len(positions)
+    A = np.zeros((n, n))
+    for i, j in edges:
+        if np.linalg.norm(positions[i] - positions[j]) <= comms_range:
+            A[i, j] = A[j, i] = 1.0
+    L = np.diag(A.sum(axis=1)) - A
+    eigvals = np.linalg.eigvalsh(L)
+    return float(np.sort(eigvals)[1])
 
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
@@ -62,7 +83,7 @@ terrain_agent = Agent(
     rrt_params=RRTParameters(
         step_size=STEP_DIST,
         max_iters=10000,
-        seed=rank + 42,
+        seed=BASE_SEED + rank,
         use_rrt_star=True,
     ),
     max_grade=30.0,
@@ -81,6 +102,8 @@ if rank == 0:
     sim_dir.mkdir(parents=True, exist_ok=True)
     for f in sim_dir.glob("frame*.png"):
         f.unlink()
+
+fiedler_log: list[float] = []  # populated on rank 0 only
 
 if terrain_path is not None and len(terrain_path) > 1:
     waypoints = np.array(terrain_path)
@@ -385,59 +408,64 @@ while True:
         has_comms_issue = False
     gathered_state = comm.gather(
         (rank, terrain_agent.position.copy(), has_comms_issue, planned_path_for_plot),
-        root=0,
+        root=0
     )
 
-    # Visualization on rank 0 after gathering all states.
+    # Rank 0: compute Fiedler value and optionally render the step frame.
     if rank == 0:
         gathered_state.sort(key=lambda x: x[0])
         positions = np.array([entry[1] for entry in gathered_state], dtype=float)
-        comms_flags = np.array([entry[2] for entry in gathered_state], dtype=bool)
-        planned_paths = [entry[3] for entry in gathered_state]
-        colors = np.where(comms_flags, "red", "blue")
 
-        fig, ax = terrain_field.plot(
-            show=False,
-            title=f"Step {step}: Agent Comms Status",
-            finalize=False,
-        )
-        terrain_field.overlay_obstacle_regions(
-            ax,
-            max_grade=terrain_agent.max_grade,
-        )
-        for i, j in comm_edges:
-            ax.plot(
-                [positions[i, 0], positions[j, 0]],
-                [positions[i, 1], positions[j, 1]],
-                color="white",
-                linewidth=1.2,
-                alpha=0.75,
-                zorder=4,
+        lam2 = fiedler_value(positions, comm_edges, terrain_agent.comms_range)
+        fiedler_log.append(lam2)
+
+        if not NO_PLOT:
+            comms_flags = np.array([entry[2] for entry in gathered_state], dtype=bool)
+            planned_paths = [entry[3] for entry in gathered_state]
+            colors = np.where(comms_flags, "red", "blue")
+
+            fig, ax = terrain_field.plot(
+                show=False,
+                title=f"Step {step}: Agent Comms Status",
+                finalize=False,
             )
-        for path in planned_paths:
-            if path.shape[0] >= 2:
+            terrain_field.overlay_obstacle_regions(
+                ax,
+                max_grade=terrain_agent.max_grade,
+            )
+            for i, j in comm_edges:
                 ax.plot(
-                    path[:, 0],
-                    path[:, 1],
-                    linestyle="--",
-                    color="black",
-                    alpha=0.5,
+                    [positions[i, 0], positions[j, 0]],
+                    [positions[i, 1], positions[j, 1]],
+                    color="white",
                     linewidth=1.2,
-                    zorder=3,
+                    alpha=0.75,
+                    zorder=4,
                 )
-        ax.scatter(
-            positions[:, 0],
-            positions[:, 1],
-            c=colors,
-            s=55,
-            edgecolors="black",
-            linewidths=0.6,
-            zorder=5,
-        )
+            for path in planned_paths:
+                if path.shape[0] >= 2:
+                    ax.plot(
+                        path[:, 0],
+                        path[:, 1],
+                        linestyle="--",
+                        color="black",
+                        alpha=0.5,
+                        linewidth=1.2,
+                        zorder=3,
+                    )
+            ax.scatter(
+                positions[:, 0],
+                positions[:, 1],
+                c=colors,
+                s=55,
+                edgecolors="black",
+                linewidths=0.6,
+                zorder=5,
+            )
 
-        frame_path = sim_dir / f"frame_{step:04d}.png"
-        fig.savefig(frame_path, dpi=120, bbox_inches="tight")
-        plt.close(fig)
+            frame_path = sim_dir / f"frame_{step:04d}.png"
+            fig.savefig(frame_path, dpi=120, bbox_inches="tight")
+            plt.close(fig)
 
     # Serialised per-rank progress print
     for r in range(size):
@@ -472,4 +500,31 @@ while True:
         break
 
 if rank == 0:
+    import json
     print(f"\nSimulation complete after {step} steps.")
+
+    fig, ax = plt.subplots(figsize=(4, 4))
+    steps = np.arange(len(fiedler_log))
+    ax.plot(steps, fiedler_log, color="steelblue", linewidth=1.5)
+    ax.set_xlabel("Simulation step")
+    ax.set_ylabel("Algebraic connectivity (λ₂)")
+    ax.set_title("Swarm connectivity over time")
+    ax.legend()
+    ax.set_ylim(bottom=0)
+    fig.tight_layout()
+    connectivity_plot_path = sim_dir / "connectivity.png"
+    fig.savefig(connectivity_plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Connectivity plot saved to {connectivity_plot_path}")
+
+    metrics = {
+        "seed": BASE_SEED,
+        "steps": step,
+        "min_fiedler": float(min(fiedler_log)) if fiedler_log else None,
+        "mean_fiedler": float(np.mean(fiedler_log)) if fiedler_log else None,
+        "fiedler_log": fiedler_log,
+    }
+    metrics_path = Path(METRICS_OUT) if METRICS_OUT else sim_dir / "metrics.jsonl"
+    with open(metrics_path, "a") as f:
+        f.write(json.dumps(metrics) + "\n")
+    print(f"Metrics appended to {metrics_path}")
